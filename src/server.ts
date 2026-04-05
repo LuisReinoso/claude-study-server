@@ -556,7 +556,7 @@ app.post("/api/summary", async (req, res) => {
     //   2. Cap input at 8K chars via 70/30 head/tail trim (preserve intro + conclusion)
     //   3. Minimize turns. maxTurns=2 is the practical floor for the Agent SDK —
     //      one turn to generate, one to emit the structured result.
-    const trimmed = trimForSummary(text, 8000);
+    const trimmed = trimForSummary(text, 5000);
     const result = await askClaudeJson(
       summarySystemPrompt(language),
       `Summarize:\n\n${trimmed}`,
