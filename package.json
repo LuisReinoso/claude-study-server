@@ -1,12 +1,29 @@
 {
   "name": "claude-study-server",
   "version": "1.0.0",
-  "description": "Always-on study server using Claude API for quiz/flashcard/summary generation",
+  "description": "Self-hosted HTTP backend that turns the Claude Agent SDK into a study assistant: generates summaries, flashcards, and quizzes for any text. Designed to pair with the obsidian-speed-reading and obsidian-study-quiz plugins, but usable from any client.",
   "main": "dist/server.js",
   "scripts": {
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsc --watch & node --watch dist/server.js"
+  },
+  "keywords": [
+    "claude",
+    "anthropic",
+    "claude-agent-sdk",
+    "study",
+    "flashcards",
+    "spaced-repetition",
+    "quiz",
+    "learning",
+    "obsidian"
+  ],
+  "author": "Luis Reinoso",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LuisReinoso/claude-study-server.git"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.91",

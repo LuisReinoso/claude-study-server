@@ -2,9 +2,20 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import express from "express";
 import cors from "cors";
 
-// Map CLAUDE_CODE_OAUTH_TOKEN_PERSONAL → CLAUDE_CODE_OAUTH_TOKEN (what the SDK reads)
-if (process.env.CLAUDE_CODE_OAUTH_TOKEN_PERSONAL && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-  process.env.CLAUDE_CODE_OAUTH_TOKEN = process.env.CLAUDE_CODE_OAUTH_TOKEN_PERSONAL;
+// The Claude Agent SDK reads CLAUDE_CODE_OAUTH_TOKEN from the environment.
+// If you keep your token under a namespaced variable (e.g. per-profile setups
+// like CLAUDE_CODE_OAUTH_TOKEN_PERSONAL / _WORK), set CLAUDE_STUDY_TOKEN_VAR
+// to that name and it will be mapped into CLAUDE_CODE_OAUTH_TOKEN here.
+const tokenVarName = process.env.CLAUDE_STUDY_TOKEN_VAR;
+if (tokenVarName && process.env[tokenVarName] && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  process.env.CLAUDE_CODE_OAUTH_TOKEN = process.env[tokenVarName];
+}
+
+if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
+  console.warn(
+    "WARNING: CLAUDE_CODE_OAUTH_TOKEN is not set. Requests will fail until you " +
+    "export it (or set CLAUDE_STUDY_TOKEN_VAR to point to your custom env var).",
+  );
 }
 
 const app = express();

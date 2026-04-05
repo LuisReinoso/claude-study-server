@@ -2,16 +2,23 @@
 Description=Claude Study Server - AI quiz/flashcard/summary generation
 After=network.target
 
+# Template systemd unit. Copy to /etc/systemd/system/ (or ~/.config/systemd/user/
+# for a user unit), then replace the placeholders below with your own values:
+#   <USER>       → the local user that should run the service
+#   <INSTALL>    → absolute path to the cloned repository
+# After editing, run:
+#   systemctl daemon-reload
+#   systemctl enable --now claude-study-server
+
 [Service]
 Type=simple
-User=luis
-WorkingDirectory=/home/luis/proyectos/study-framework/claude-study-server
-ExecStart=/usr/bin/node /home/luis/proyectos/study-framework/claude-study-server/dist/server.js
+User=<USER>
+WorkingDirectory=<INSTALL>
+ExecStart=/usr/bin/node <INSTALL>/dist/server.js
 Restart=on-failure
 RestartSec=5
 Environment=STUDY_SERVER_PORT=3457
-Environment=CLAUDE_CODE_OAUTH_TOKEN_PERSONAL=${CLAUDE_CODE_OAUTH_TOKEN_PERSONAL}
-EnvironmentFile=/home/luis/proyectos/study-framework/claude-study-server/.env
+EnvironmentFile=<INSTALL>/.env
 
 [Install]
 WantedBy=multi-user.target
