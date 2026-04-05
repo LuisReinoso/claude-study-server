@@ -4,6 +4,7 @@
   "description": "Self-hosted HTTP backend that turns the Claude Agent SDK into a study assistant: generates summaries, flashcards, and quizzes for any text. Designed to pair with the obsidian-speed-reading and obsidian-study-quiz plugins, but usable from any client.",
   "main": "dist/server.js",
   "scripts": {
+    "test": "jest",
     "build": "tsc",
     "start": "node dist/server.js",
     "dev": "tsc --watch & node --watch dist/server.js"
@@ -27,13 +28,16 @@
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "^0.2.91",
-    "express": "^4.21.0",
-    "cors": "^2.8.5"
+    "cors": "^2.8.5",
+    "express": "^4.21.0"
   },
   "devDependencies": {
-    "@types/express": "^5.0.0",
     "@types/cors": "^2.8.17",
+    "@types/express": "^5.0.0",
+    "@types/jest": "^30.0.0",
     "@types/node": "^22.0.0",
+    "jest": "^30.3.0",
+    "ts-jest": "^29.4.9",
     "typescript": "^5.6.0"
   }
 }
