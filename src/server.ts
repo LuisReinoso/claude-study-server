@@ -1,24 +1,18 @@
-import { query } from "@anthropic-ai/claude-agent-sdk";
 import express from "express";
 import cors from "cors";
 import { trimForSummary } from "./trim";
 import { STOPWORDS, tokenize, jaccard, selectDiverse, DiversityItem } from "./diversity";
 
-// The Claude Agent SDK reads CLAUDE_CODE_OAUTH_TOKEN from the environment.
-// If you keep your token under a namespaced variable (e.g. per-profile setups
-// like CLAUDE_CODE_OAUTH_TOKEN_PERSONAL / _WORK), set CLAUDE_STUDY_TOKEN_VAR
-// to that name and it will be mapped into CLAUDE_CODE_OAUTH_TOKEN here.
-const tokenVarName = process.env.CLAUDE_STUDY_TOKEN_VAR;
-if (tokenVarName && process.env[tokenVarName] && !process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-  process.env.CLAUDE_CODE_OAUTH_TOKEN = process.env[tokenVarName];
-}
-
-if (!process.env.CLAUDE_CODE_OAUTH_TOKEN) {
-  console.warn(
-    "WARNING: CLAUDE_CODE_OAUTH_TOKEN is not set. Requests will fail until you " +
-    "export it (or set CLAUDE_STUDY_TOKEN_VAR to point to your custom env var).",
-  );
-}
+// Backend: Ollama daemon on localhost. This replaces the Claude Agent SDK,
+// which spawned the `claude` CLI as a subprocess — a model that is fragile
+// when the service runs under systemd (PATH / HOME / config-dir issues, no
+// TTY, env-var divergence between user shell and daemon). Ollama exposes an
+// HTTP API on localhost:11434 that transparently handles both local and
+// cloud models (cloud models are authenticated once via `ollama signin` and
+// routed through the same local endpoint). No API keys are stored in this
+// service — only the model name matters.
+const OLLAMA_HOST = process.env.OLLAMA_HOST || "http://127.0.0.1:11434";
+const OLLAMA_MODEL = process.env.OLLAMA_MODEL || "glm-5.1:cloud";
 
 const app = express();
 app.use(cors());
@@ -118,99 +112,15 @@ const summarySchema = {
   required: ["summary", "keyTerms", "topics"] as const,
 };
 
-// ===== CLAUDE HELPERS =====
-
-interface AskOptions {
-  enableWebSearch?: boolean;
-  model?: string;
-  maxTurns?: number;
-}
+// ===== OLLAMA HELPERS =====
 
 /**
- * Fast single-turn JSON generation. Skips the Agent SDK's outputFormat /
- * JSON-schema mode (which forces an extra validation turn) and instead
- * embeds the JSON instruction in the system prompt with maxTurns=1. This
- * cuts latency by ~60-70% because the SDK only does one round trip instead
- * of two. The trade-off: no schema validation — the prompt must be clear
- * enough that Claude returns well-formed JSON. For our use case the prompts
- * are already strict and the parseJsonFromText fallback handles minor
- * formatting issues.
+ * Extracts a JSON object from a model response. Ollama's `format: "json"`
+ * already guarantees valid JSON, but some models still wrap it in markdown
+ * fences. This helper strips fences and falls back to bracket-matching.
  */
-async function askClaudeJsonFast(
-  systemPrompt: string,
-  userMessage: string,
-  model?: string,
-): Promise<any> {
-  const messages: any[] = [];
-
-  const queryOptions: any = {
-    maxTurns: 1,
-    allowedTools: [],
-    systemPrompt:
-      systemPrompt +
-      "\n\nCRITICAL: Respond ONLY with a single valid JSON object. " +
-      "No explanation, no markdown fences, no text before or after — just the raw JSON.",
-  };
-  if (model) queryOptions.model = model;
-
-  for await (const message of query({
-    prompt: userMessage,
-    options: queryOptions,
-  })) {
-    messages.push(message);
-  }
-
-  const text = extractText(messages);
-  return parseJsonFromText(text);
-}
-
-/**
- * Multi-turn JSON generation using the Agent SDK's outputFormat / JSON-schema
- * mode. Slower but guarantees schema conformance. Reserved for the /api/generate
- * proxy endpoint or any future endpoint where correctness > speed.
- */
-async function askClaudeJson(
-  systemPrompt: string,
-  userMessage: string,
-  schema: any,
-  opts: AskOptions = {},
-): Promise<any> {
-  const { enableWebSearch = false, model, maxTurns } = opts;
-  const messages: any[] = [];
-
-  const resolvedMaxTurns = maxTurns ?? (enableWebSearch ? 6 : 2);
-
-  const queryOptions: any = {
-    maxTurns: resolvedMaxTurns,
-    allowedTools: enableWebSearch ? ["WebSearch", "WebFetch"] : [],
-    systemPrompt: enableWebSearch
-      ? systemPrompt + "\n\nYou have access to web search. Use it to VERIFY facts and enrich answers with current, accurate information when needed."
-      : systemPrompt,
-    outputFormat: {
-      type: "json_schema",
-      schema,
-    },
-  };
-  if (model) queryOptions.model = model;
-
-  for await (const message of query({
-    prompt: userMessage,
-    options: queryOptions,
-  })) {
-    messages.push(message);
-  }
-
-  for (const msg of messages) {
-    if (msg.type === "result" && msg.structured_output) {
-      return msg.structured_output;
-    }
-  }
-
-  const text = extractText(messages);
-  return parseJsonFromText(text);
-}
-
 function parseJsonFromText(text: string): any {
+  if (!text) throw new Error("Empty response from model");
   try { return JSON.parse(text.trim()); } catch {}
   const codeBlock = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
   if (codeBlock) { try { return JSON.parse(codeBlock[1]); } catch {} }
@@ -219,49 +129,73 @@ function parseJsonFromText(text: string): any {
   throw new Error("Could not parse JSON from response");
 }
 
-async function askClaudeText(systemPrompt: string, userMessage: string): Promise<string> {
-  const messages: any[] = [];
+/**
+ * Single HTTP call to the local Ollama daemon's chat endpoint. No SDK, no
+ * subprocess, no multi-turn loop. `format: "json"` tells Ollama to constrain
+ * the output to valid JSON. For cloud models (e.g. `glm-5.1:cloud`), the
+ * daemon transparently proxies to ollama.com using credentials established
+ * once via `ollama signin` — no API key is needed in this service.
+ */
+async function askOllamaJson(
+  systemPrompt: string,
+  userMessage: string,
+  model: string = OLLAMA_MODEL,
+): Promise<any> {
+  const resp = await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      format: "json",
+      options: { temperature: 0.7 },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userMessage },
+      ],
+    }),
+  });
 
-  for await (const message of query({
-    prompt: userMessage,
-    options: {
-      maxTurns: 1,
-      allowedTools: [],
-      systemPrompt,
-    },
-  })) {
-    messages.push(message);
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Ollama ${resp.status}: ${body.substring(0, 300)}`);
   }
 
-  return extractText(messages);
+  const data: any = await resp.json();
+  const text: string = data?.message?.content ?? "";
+  return parseJsonFromText(text);
 }
 
-function extractText(messages: any[]): string {
-  const parts: string[] = [];
-  for (const msg of messages) {
-    if (msg?.message?.content) {
-      for (const block of msg.message.content) {
-        if (block.type === "text" && block.text) parts.push(block.text);
-      }
-    }
-    if (msg?.content) {
-      if (typeof msg.content === "string") parts.push(msg.content);
-      else if (Array.isArray(msg.content)) {
-        for (const block of msg.content) {
-          if (block.type === "text" && block.text) parts.push(block.text);
-        }
-      }
-    }
-    if (msg?.result?.text) parts.push(msg.result.text);
+/**
+ * Free-form text generation via Ollama (no JSON constraint). Used by the
+ * legacy /api/generate proxy endpoint that the quiz plugin calls directly.
+ */
+async function askOllamaText(
+  systemPrompt: string,
+  userMessage: string,
+  model: string = OLLAMA_MODEL,
+): Promise<string> {
+  const resp = await fetch(`${OLLAMA_HOST}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model,
+      stream: false,
+      options: { temperature: 0.7 },
+      messages: [
+        ...(systemPrompt ? [{ role: "system", content: systemPrompt }] : []),
+        { role: "user", content: userMessage },
+      ],
+    }),
+  });
+
+  if (!resp.ok) {
+    const body = await resp.text();
+    throw new Error(`Ollama ${resp.status}: ${body.substring(0, 300)}`);
   }
-  return parts.join("");
-}
 
-function extractAndParse(messages: any[]): any {
-  const text = extractText(messages);
-  const match = text.match(/```json\s*([\s\S]*?)\s*```/) || text.match(/\{[\s\S]*\}/);
-  if (match) return JSON.parse(match[1] || match[0]);
-  return JSON.parse(text);
+  const data: any = await resp.json();
+  return data?.message?.content ?? "";
 }
 
 // ===== DIVERSITY / OVER-GENERATE + RANK =====
@@ -395,7 +329,7 @@ ${language !== "en" ? `Write in ${language}.` : ""}`;
 // ===== ENDPOINTS =====
 
 app.get("/api/health", (_req, res) => {
-  res.json({ status: "ok", sdk: "claude-agent-sdk", jsonMode: true });
+  res.json({ status: "ok", backend: "ollama", model: OLLAMA_MODEL, host: OLLAMA_HOST });
 });
 
 // Generic proxy - used by quiz-generator plugin (no JSON schema, returns raw text)
@@ -404,7 +338,7 @@ app.post("/api/generate", async (req, res) => {
     const { system, userMessage } = req.body;
     if (!userMessage) { res.status(400).json({ error: "userMessage is required" }); return; }
 
-    const text = await askClaudeText(system || "", userMessage);
+    const text = await askOllamaText(system || "", userMessage);
     res.json({ text, stopReason: "end_turn" });
   } catch (err: any) {
     console.error("Generate error:", err.message);
@@ -413,12 +347,12 @@ app.post("/api/generate", async (req, res) => {
 });
 
 // All endpoints are mobile-critical: Android kills HTTP sockets at ~10-20s.
-// Every endpoint uses Haiku (3-5x faster than Sonnet), trims input to 5K via
-// trimForSummary (70/30 head/tail split), uses maxTurns=2, and over-generates
-// by only 1.25x. Quality comes from prompt engineering + diversity filter,
-// not model size or web search.
+// Every endpoint trims input to 5K via trimForSummary (70/30 head/tail split)
+// and over-generates by 1.25x. Quality comes from prompt engineering + the
+// diversity filter, not model size. With Ollama the latency is dominated by
+// the model itself, not SDK overhead — a single HTTP round-trip to the local
+// daemon, which proxies to the cloud when the model has a `:cloud` suffix.
 const OVERGEN_FACTOR = 1.25;
-const MOBILE_OPTS: AskOptions = { model: "claude-haiku-4-5", maxTurns: 2 };
 const INPUT_TRIM = 5000;
 
 app.post("/api/quiz", async (req, res) => {
@@ -430,10 +364,9 @@ app.post("/api/quiz", async (req, res) => {
 
     const overCount = Math.ceil(count * OVERGEN_FACTOR);
     const trimmed = trimForSummary(text, INPUT_TRIM);
-    const result = await askClaudeJsonFast(
+    const result = await askOllamaJson(
       quizSystemPrompt(language, types, overCount),
       `Generate quiz questions about:\n\n${trimmed}`,
-      "claude-haiku-4-5",
     );
 
     const rawQuestions: any[] = Array.isArray(result?.questions) ? result.questions
@@ -464,10 +397,9 @@ app.post("/api/flashcards", async (req, res) => {
 
     const overCount = Math.ceil(count * OVERGEN_FACTOR);
     const trimmed = trimForSummary(text, INPUT_TRIM);
-    const result = await askClaudeJsonFast(
+    const result = await askOllamaJson(
       flashcardsSystemPrompt(language, overCount),
       `Generate flashcards from:\n\n${trimmed}`,
-      "claude-haiku-4-5",
     );
 
     const rawCards: any[] = Array.isArray(result?.cards) ? result.cards
@@ -499,16 +431,12 @@ app.post("/api/summary", async (req, res) => {
     if (text.trim().split(/\s+/).length < 20) { res.status(400).json({ error: `Summary: Text too short (${text.trim().split(/\s+/).length} words). Need at least 20 words.` }); return; }
 
     // Summary is latency-critical: it blocks the pre-reading flow and is called
-    // from mobile, where HTTP clients enforce ~30s socket timeouts. We:
-    //   1. Use Haiku (3-5x faster than Sonnet/Opus) — quality is fine for digests
-    //   2. Cap input at 8K chars via 70/30 head/tail trim (preserve intro + conclusion)
-    //   3. Minimize turns. maxTurns=2 is the practical floor for the Agent SDK —
-    //      one turn to generate, one to emit the structured result.
+    // from mobile, where HTTP clients enforce ~10-20s socket timeouts. With
+    // Ollama the daemon handles model + cloud routing in a single round trip.
     const trimmed = trimForSummary(text, INPUT_TRIM);
-    const result = await askClaudeJsonFast(
+    const result = await askOllamaJson(
       summarySystemPrompt(language),
       `Summarize:\n\n${trimmed}`,
-      "claude-haiku-4-5",
     );
     console.log(`[summary] bytesIn=${text.length} bytesSent=${trimmed.length} elapsedMs=${Date.now() - started}`);
     res.json(result);
@@ -522,6 +450,6 @@ app.post("/api/summary", async (req, res) => {
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Claude Study Server running on http://0.0.0.0:${PORT}`);
-  console.log(`Using: Claude Agent SDK (OAuth token + JSON schema mode)`);
+  console.log(`Backend: Ollama at ${OLLAMA_HOST}, default model: ${OLLAMA_MODEL}`);
   console.log(`Endpoints: /api/health, /api/generate, /api/quiz, /api/flashcards, /api/summary`);
 });
